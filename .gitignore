@@ -1,0 +1,6 @@
+/target
+.vs/
+out/
+/deps/src
+/deps/cxx-async
+/deps/env.sh

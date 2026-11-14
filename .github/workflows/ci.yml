@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git clone https://github.com/pcwalton/cxx-async deps/cxx-async
+          git -C deps/cxx-async checkout 1575822aa7fcf484b37f43b52e60bb168b259760
+          git -C deps/cxx-async apply ../patches/cxx-async.patch
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  engine:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps/src
+            deps/cxx-async
+          key: deps-${{ matrix.os }}-${{ hashFiles('deps/build.sh', 'deps/build.ps1', 'deps/patches/*') }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y ninja-build
+      - if: runner.os == 'macOS'
+        run: brew install ninja
+      - if: runner.os != 'Windows'
+        run: |
+          deps/build.sh > deps/env.sh
+          cat deps/env.sh | sed 's/^export //' >> "$GITHUB_ENV"
+
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: . deps/build.ps1
+
+      - run: cargo test

@@ -1,0 +1,277 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index b5a149d..dfb7277 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -3248,6 +3248,21 @@ OPENSSL_EXPORT int SSL_set_verify_algorithm_prefs(SSL *ssl,
+                                                   const uint16_t *prefs,
+                                                   size_t num_prefs);
+ 
++// cipher suites written exactly as given, empty restores the default
++OPENSSL_EXPORT int SSL_set_write_cipher_list_override(SSL *ssl,
++                                                      const uint16_t *ciphers,
++                                                      size_t num_ciphers);
++
++// supported_versions written exactly as given, empty restores the default
++OPENSSL_EXPORT int SSL_set_write_supported_versions_override(
++    SSL *ssl, const uint16_t *versions, size_t num_versions);
++
++// grease in signature_algorithms, on by default
++OPENSSL_EXPORT void SSL_set_signature_algorithm_grease(SSL *ssl, int enabled);
++
++// rfc 7685 padding to 512 bytes, off by default
++OPENSSL_EXPORT void SSL_set_client_hello_padding(SSL *ssl, int enabled);
++
+ 
+ // Certificate authorities.
+ //
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 8d0b99f..e5880b2 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -1031,7 +1031,7 @@ static bool ext_sigalgs_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+     return false;
+   }
+   // Add a fake signature algorithm. See RFC 8701.
+-  if (hs->ssl->ctx->grease_enabled &&
++  if (hs->ssl->ctx->grease_enabled && hs->config->sigalg_grease &&
+       !CBB_add_u16(&sigalgs_cbb,
+                    ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
+     return false;
+@@ -2682,6 +2682,17 @@ static bool ext_supported_versions_add_clienthello(
+     return false;
+   }
+ 
++  const Array<uint16_t> &version_override =
++      hs->config->client_supported_versions_override;
++  if (!version_override.empty() && type != ssl_client_hello_inner) {
++    for (uint16_t version : version_override) {
++      if (!CBB_add_u16(&versions, version)) {
++        return false;
++      }
++    }
++    return CBB_flush(out);
++  }
++
+   // Encrypted ClientHellos requires TLS 1.3 or later.
+   uint16_t extra_min_version =
+       type == ssl_client_hello_inner ? TLS1_3_VERSION : 0;
+@@ -4499,6 +4510,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+ 
+   assert(out_encoded == nullptr);  // Only ClientHelloInner needs two outputs.
+   SSLImpl *const ssl = hs->ssl;
++  const size_t header_len = CBB_len(out);
+   CBB extensions;
+   if (!CBB_add_u16_length_prefixed(out, &extensions)) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+@@ -4547,6 +4559,20 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+     last_was_empty = false;
+   }
+ 
++  if (hs->config->client_hello_padding && !SSL_is_dtls(ssl) &&
++      !SSL_is_quic(ssl) && !ssl->s3->used_hello_retry_request) {
++    const size_t len =
++        SSL3_HM_HEADER_LENGTH + header_len + 2 + CBB_len(&extensions);
++    if (len > 0xff && len < 0x200) {
++      const size_t padding_len = 0x200 - len >= 5 ? 0x200 - len - 4 : 1;
++      if (!add_padding_extension(&extensions, TLSEXT_TYPE_padding,
++                                 padding_len)) {
++        return false;
++      }
++      last_was_empty = false;
++    }
++  }
++
+   // The final extension must be non-empty. WebSphere Application Server 7.0 is
+   // intolerant to the last extension being zero-length. See
+   // https://crbug.com/363583.
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 3d57f34..71c22b0 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -100,38 +100,48 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     return false;
+   }
+ 
+-  // Add TLS 1.3 ciphers in configured preference order.
+-  if (hs->max_version >= TLS1_3_VERSION) {
+-    for (const SSL_CIPHER *cipher : hs->config->tls13_cipher_list.ciphers()) {
+-      if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++  const Array<uint16_t> &cipher_override =
++      hs->config->client_cipher_list_override;
++  if (!cipher_override.empty() && type != ssl_client_hello_inner) {
++    for (uint16_t cipher : cipher_override) {
++      if (!CBB_add_u16(&child, cipher)) {
+         return false;
+       }
+     }
+-  }
+-
+-  if (hs->min_version < TLS1_3_VERSION && type != ssl_client_hello_inner) {
+-    bool any_enabled = false;
+-    for (const SSL_CIPHER *cipher : SSL_get_ciphers(ssl)) {
+-      // Skip disabled ciphers
+-      if ((cipher->algorithm_mkey & mask_k) ||
+-          (cipher->algorithm_auth & mask_a)) {
+-        continue;
++  } else {
++    // Add TLS 1.3 ciphers in configured preference order.
++    if (hs->max_version >= TLS1_3_VERSION) {
++      for (const SSL_CIPHER *cipher : hs->config->tls13_cipher_list.ciphers()) {
++        if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++          return false;
++        }
+       }
+-      if (SSL_CIPHER_get_min_version(cipher) > hs->max_version ||
+-          SSL_CIPHER_get_max_version(cipher) < hs->min_version) {
+-        continue;
++    }
++
++    if (hs->min_version < TLS1_3_VERSION && type != ssl_client_hello_inner) {
++      bool any_enabled = false;
++      for (const SSL_CIPHER *cipher : SSL_get_ciphers(ssl)) {
++        // Skip disabled ciphers
++        if ((cipher->algorithm_mkey & mask_k) ||
++            (cipher->algorithm_auth & mask_a)) {
++          continue;
++        }
++        if (SSL_CIPHER_get_min_version(cipher) > hs->max_version ||
++            SSL_CIPHER_get_max_version(cipher) < hs->min_version) {
++          continue;
++        }
++        any_enabled = true;
++        if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++          return false;
++        }
+       }
+-      any_enabled = true;
+-      if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++
++      // If all ciphers were disabled, return the error to the caller.
++      if (!any_enabled && hs->max_version < TLS1_3_VERSION) {
++        OPENSSL_PUT_ERROR(SSL, SSL_R_NO_CIPHERS_AVAILABLE);
+         return false;
+       }
+     }
+-
+-    // If all ciphers were disabled, return the error to the caller.
+-    if (!any_enabled && hs->max_version < TLS1_3_VERSION) {
+-      OPENSSL_PUT_ERROR(SSL, SSL_R_NO_CIPHERS_AVAILABLE);
+-      return false;
+-    }
+   }
+ 
+   if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV) {
+diff --git a/ssl/internal.h b/ssl/internal.h
+index bff133b..a5c6eb8 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3423,6 +3423,12 @@ struct SSL_CONFIG {
+   // Inherited from `SSL_CTX`.
+   SSLCipherPreferenceList tls13_cipher_list;
+ 
++  Array<uint16_t> client_cipher_list_override;
++  Array<uint16_t> client_supported_versions_override;
++
++  bool sigalg_grease = true;
++  bool client_hello_padding = false;
++
+   // This is used to hold the local certificate used (i.e. the server
+   // certificate for a server or the client certificate for a client).
+   UniquePtr<CERT> cert;
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index f28a49b..cebf468 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -1958,6 +1958,43 @@ int SSL_CTX_set1_group_ids_with_flags(SSL_CTX *ctx, const uint16_t *group_ids,
+                                  &ctx_impl->supported_group_list_flags);
+ }
+ 
++int SSL_set_write_cipher_list_override(SSL *ssl, const uint16_t *ciphers,
++                                       size_t num_ciphers) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return 0;
++  }
++  return ssl_impl->config->client_cipher_list_override.CopyFrom(
++      Span(ciphers, num_ciphers));
++}
++
++int SSL_set_write_supported_versions_override(SSL *ssl,
++                                              const uint16_t *versions,
++                                              size_t num_versions) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return 0;
++  }
++  return ssl_impl->config->client_supported_versions_override.CopyFrom(
++      Span(versions, num_versions));
++}
++
++void SSL_set_signature_algorithm_grease(SSL *ssl, int enabled) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return;
++  }
++  ssl_impl->config->sigalg_grease = !!enabled;
++}
++
++void SSL_set_client_hello_padding(SSL *ssl, int enabled) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return;
++  }
++  ssl_impl->config->client_hello_padding = !!enabled;
++}
++
+ int SSL_set1_group_ids(SSL *ssl, const uint16_t *group_ids,
+                        size_t num_group_ids) {
+   return SSL_set1_group_ids_with_flags(ssl, group_ids, /*flags=*/nullptr,
+diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
+index f009ca2..10b487b 100644
+--- a/ssl/ssl_privkey.cc
++++ b/ssl/ssl_privkey.cc
+@@ -594,8 +594,9 @@ static bool sigalgs_unique(Span<const uint16_t> in_sigalgs) {
+   return true;
+ }
+ 
+-static bool set_sigalg_prefs(Array<uint16_t> *out, Span<const uint16_t> prefs) {
+-  if (!sigalgs_unique(prefs)) {
++static bool set_sigalg_prefs(Array<uint16_t> *out, Span<const uint16_t> prefs,
++                             bool allow_duplicates = false) {
++  if (!allow_duplicates && !sigalgs_unique(prefs)) {
+     return false;
+   }
+ 
+@@ -957,7 +958,7 @@ int SSL_set1_sigalgs_list(SSL *ssl, const char *str) {
+ int SSL_CTX_set_verify_algorithm_prefs(SSL_CTX *ctx, const uint16_t *prefs,
+                                        size_t num_prefs) {
+   return set_sigalg_prefs(&FromOpaque(ctx)->verify_sigalgs,
+-                          Span(prefs, num_prefs));
++                          Span(prefs, num_prefs), /*allow_duplicates=*/true);
+ }
+ 
+ int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
+@@ -969,5 +970,5 @@ int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
+   }
+ 
+   return set_sigalg_prefs(&ssl_impl->config->verify_sigalgs,
+-                          Span(prefs, num_prefs));
++                          Span(prefs, num_prefs), /*allow_duplicates=*/true);
+ }
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index ecff1a0..6a9256f 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -10846,10 +10846,8 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
+                                                    std::size(kDuplicatePrefs)));
+   EXPECT_TRUE(
+       ErrorsAreAndClear({{ERR_LIB_SSL, SSL_R_DUPLICATE_SIGNATURE_ALGORITHM}}));
+-  EXPECT_FALSE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
+-                                                  std::size(kDuplicatePrefs)));
+-  EXPECT_TRUE(
+-      ErrorsAreAndClear({{ERR_LIB_SSL, SSL_R_DUPLICATE_SIGNATURE_ALGORITHM}}));
++  EXPECT_TRUE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
++                                                 std::size(kDuplicatePrefs)));
+ }
+ 
+ TEST(SSLTest, InvalidGroups) {

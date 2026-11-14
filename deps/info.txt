@@ -1,0 +1,53 @@
+Native dependencies
+===================
+
+deps/build.sh (Linux, macOS) and deps/build.ps1 (Windows, from a Visual Studio
+developer prompt) fetch and build everything below. The engine
+needs these four directories, given to cargo as environment variables:
+
+  BORINGSSL_DIR  BoringSSL 148a7b1f (2026-11-13) + patches/boringssl.patch
+  NGHTTP2_DIR    nghttp2 v1.71.0 + patches/nghttp2.patch
+  LIBUV_DIR      libuv v1.53.0, unmodified
+  CPPCORO_DIR    cppcoro from andreasbuhr/cppcoro 8642e985 (C++20 coroutines)
+
+Each is a source tree with its CMake build in a build/ subdirectory. The crate
+also expects cxx-async 1575822a + patches/cxx-async.patch in deps/cxx-async.
+
+Without the variables only the Rust side compiles, which is enough for clippy.
+
+The patches
+-----------
+
+boringssl.patch
+  SSL_set_write_cipher_list_override, SSL_set_write_supported_versions_override:
+  write these ClientHello lists exactly as given (stock BoringSSL fixes their
+  contents and order). SSL_set_signature_algorithm_grease: turn the GREASE value
+  in signature_algorithms off while keeping GREASE elsewhere (Safari).
+  SSL_set_client_hello_padding: RFC 7685 padding to 512 bytes, which BoringSSL
+  dropped (Safari still pads). Verify preferences may repeat a value (Safari
+  lists rsa_pss_rsae_sha384 twice).
+
+nghttp2.patch
+  RFC 7540 priorities in HEADERS and nghttp2_submit_priority work again (upstream
+  ignores them since RFC 9113; Chrome still sends them). Per-field HPACK flags:
+  NGHTTP2_NV_FLAG_INDEX, NGHTTP2_NV_FLAG_WITHOUT_INDEXING,
+  NGHTTP2_NV_FLAG_HUFFMAN, NGHTTP2_NV_FLAG_NO_HUFFMAN, so the encoder can follow
+  a browser's choices instead of nghttp2's heuristic.
+
+cxx-async.patch
+  The C++ side returned the new channel by value while the Rust side writes it
+  through an out pointer given as the first argument. That only lines up where
+  the hidden return pointer is the first argument (x86-64); on arm64 it goes in
+  x8, so every coroutine crashed on Apple Silicon. The channel is now built in
+  place through an explicit pointer. Also: GCC rejects the leading "::" in the
+  coroutine_traits specialization, and MSVC needs /std:c++20 for cxx-async's
+  own source.
+
+Windows
+-------
+
+deps/build.ps1 does the same with Ninja and MSVC. BoringSSL is built without
+assembly (OPENSSL_NO_ASM) so no NASM is needed. Dot-source it so the variables
+stay set:
+
+  . deps/build.ps1

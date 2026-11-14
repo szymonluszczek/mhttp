@@ -1,0 +1,32 @@
+[package]
+name = "mhttp"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP/1.1 and HTTP/2 client with a configurable TLS and HTTP/2 fingerprint"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22.0"
+base64-serde = "0.7.0"
+brotli = "3.3.4"
+cookie = "0.16.2"
+cookie_store = "0.19.0"
+cxx = "1.0"
+cxx-async = { path = "./deps/cxx-async/cxx-async" }
+flate2 = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+url = "2.2.2"
+zstd = "0.13"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[build-dependencies]
+cc = "1.0"
+cxx-build = "1.0"
+
+[features]
+# compiles the engine's debug log lines in
+debug-log = []

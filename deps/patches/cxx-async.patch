@@ -1,0 +1,57 @@
+diff --git a/cxx-async/build.rs b/cxx-async/build.rs
+index 49a0590..8199a88 100644
+--- a/cxx-async/build.rs
++++ b/cxx-async/build.rs
+@@ -41,6 +41,7 @@ fn main() {
+         .cargo_warnings(false)
+         .files(&vec!["src/cxx_async.cpp"])
+         .flag_if_supported("-std=c++20")
++        .flag_if_supported("/std:c++20")
+         .include("include")
+         .compile("cxx-async");
+ }
+diff --git a/cxx-async/include/rust/cxx_async.h b/cxx-async/include/rust/cxx_async.h
+index e3ccc9d..8c5c098 100644
+--- a/cxx-async/include/rust/cxx_async.h
++++ b/cxx-async/include/rust/cxx_async.h
+@@ -153,7 +153,7 @@
+   };                                                                        \
+   CXXASYNC_CLOSE_NAMESPACE(__VA_ARGS__)                                     \
+   template <typename... Args>                                               \
+-  struct ::rust::async::std_coroutine::                                     \
++  struct rust::async::std_coroutine::                                       \
+       coroutine_traits<CXXASYNC_JOIN_NAMESPACE(__VA_ARGS__), Args...> {     \
+     using promise_type =                                                    \
+         ::rust::async::RustPromise<CXXASYNC_JOIN_NAMESPACE(__VA_ARGS__)>;   \
+@@ -190,7 +190,8 @@ struct RustExeclet;
+ 
+ template <typename Future>
+ struct Vtable {
+-  RustChannel<Future> (*channel)(RustExeclet* execlet);
++  // out pointer, by value broke on arm64
++  void (*channel)(RustChannel<Future>* out, RustExeclet* execlet);
+   uint32_t (*sender_send)(
+       RustSender<Future>& self,
+       uint32_t status,
+@@ -730,11 +731,18 @@ class RustPromiseBase {
+   RustPromiseBase& operator=(const RustPromiseBase&) = delete;
+ 
+  protected:
+-  Channel m_channel;
++  union {
++    Channel m_channel;
++  };
+ 
+  public:
+-  RustPromiseBase()
+-      : m_execlet(), m_channel(Future::vtable()->channel(m_execlet.raw())) {}
++  RustPromiseBase() : m_execlet() {
++    Future::vtable()->channel(&m_channel, m_execlet.raw());
++  }
++
++  ~RustPromiseBase() {
++    m_channel.~Channel();
++  }
+ 
+   Future get_return_object() noexcept {
+     return std::move(m_channel.future);
